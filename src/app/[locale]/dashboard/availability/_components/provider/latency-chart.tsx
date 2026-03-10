@@ -158,7 +158,7 @@ export function LatencyChart({ providers, className }: LatencyChartProps) {
                         />
                         <span className="text-muted-foreground">
                           {chartConfig[item.dataKey as keyof typeof chartConfig]?.label ||
-                            item.dataKey}
+                            String(item.dataKey)}
                           :
                         </span>
                         <span className="font-mono">{formatLatency(item.value as number)}</span>

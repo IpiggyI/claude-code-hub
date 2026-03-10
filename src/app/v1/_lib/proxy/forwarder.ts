@@ -52,8 +52,10 @@ import {
   isClientAbortError,
   isEmptyResponseError,
   isHttp2Error,
+  isSuspectedUpstreamAbortBeforeFirstByte,
   isSSLCertificateError,
   ProxyError,
+  SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE_THRESHOLD_MS,
   sanitizeUrl,
 } from "./errors";
 import { ModelRedirector } from "./model-redirector";
@@ -992,10 +994,55 @@ export class ProxyForwarder {
           // ⭐ 1. 分类错误（供应商错误 vs 系统错误 vs 客户端中断）
           // 使用异步版本确保错误规则已加载
           let errorCategory = await categorizeErrorAsync(lastError);
-          const errorMessage =
+          let errorMessage =
             lastError instanceof ProxyError
               ? lastError.getDetailedErrorMessage()
               : lastError.message;
+
+          if (
+            errorCategory === ErrorCategory.CLIENT_ABORT &&
+            lastError instanceof ProxyError &&
+            lastError.classificationHint === "client_abort" &&
+            isSuspectedUpstreamAbortBeforeFirstByte(session)
+          ) {
+            const waitMs = Math.max(
+              0,
+              Date.now() - (session.forwardStartTime ?? session.startTime)
+            );
+
+            logger.warn(
+              "ProxyForwarder: Suspected upstream abort before first byte, reclassifying as provider error",
+              {
+                providerId: currentProvider.id,
+                providerName: currentProvider.name,
+                attemptNumber: attemptCount,
+                totalProvidersAttempted,
+                waitMs,
+                thresholdMs: SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE_THRESHOLD_MS,
+              }
+            );
+
+            lastError = new ProxyError("供应商在首字节返回前中断了连接", 502, {
+              body: JSON.stringify({
+                error: {
+                  type: "upstream_abort_before_first_byte",
+                  message: "Upstream connection closed before first byte reached the client",
+                  wait_ms: waitMs,
+                },
+              }),
+              parsed: {
+                error: {
+                  type: "upstream_abort_before_first_byte",
+                  message: "Upstream connection closed before first byte reached the client",
+                  wait_ms: waitMs,
+                },
+              },
+              providerId: currentProvider.id,
+              providerName: currentProvider.name,
+            });
+            errorCategory = ErrorCategory.PROVIDER_ERROR;
+            errorMessage = lastError.getDetailedErrorMessage();
+          }
 
           const isTimeoutError = lastError instanceof ProxyError && lastError.statusCode === 524;
           if (attemptCount <= endpointCandidates.length) {
@@ -2506,7 +2553,9 @@ export class ProxyForwarder {
           err.name === "ResponseAborted"
             ? "Response transmission aborted"
             : "Request aborted by client",
-          499 // Nginx 使用的 "Client Closed Request" 状态码
+          499, // Nginx 使用的 "Client Closed Request" 状态码
+          undefined,
+          "client_abort"
         );
       }
 

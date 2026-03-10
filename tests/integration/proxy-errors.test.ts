@@ -15,7 +15,13 @@
  */
 
 import { beforeAll, describe, expect, test } from "vitest";
-import { isNonRetryableClientError, ProxyError } from "@/app/v1/_lib/proxy/errors";
+import {
+  categorizeErrorAsync,
+  ErrorCategory,
+  isClientAbortError,
+  isNonRetryableClientError,
+  ProxyError,
+} from "@/app/v1/_lib/proxy/errors";
 import { errorRuleDetector } from "@/lib/error-rule-detector";
 
 // Wait for initial cache load
@@ -240,6 +246,26 @@ describe("ProxyError Message Extraction", () => {
     const error = new ProxyError("blocked by our content filter policy", 400);
 
     expect(isNonRetryableClientError(error)).toBe(true);
+  });
+});
+
+describe("Client Abort Classification", () => {
+  test("should treat upstream HTTP 499 as provider error", async () => {
+    const error = new ProxyError("upstream returned 499", 499, {
+      body: '{"error":"upstream canceled"}',
+      providerId: 1,
+      providerName: "test-provider",
+    });
+
+    expect(isClientAbortError(error)).toBe(false);
+    await expect(categorizeErrorAsync(error)).resolves.toBe(ErrorCategory.PROVIDER_ERROR);
+  });
+
+  test("should keep proxy-generated client abort 499 as client abort", async () => {
+    const error = new ProxyError("Request aborted by client", 499, undefined, "client_abort");
+
+    expect(isClientAbortError(error)).toBe(true);
+    await expect(categorizeErrorAsync(error)).resolves.toBe(ErrorCategory.CLIENT_ABORT);
   });
 });
 

@@ -61,7 +61,7 @@ vi.mock("@/app/v1/_lib/proxy/errors", async (importOriginal) => {
 });
 
 import { ProxyForwarder } from "@/app/v1/_lib/proxy/forwarder";
-import { ProxyError } from "@/app/v1/_lib/proxy/errors";
+import { ErrorCategory, ProxyError } from "@/app/v1/_lib/proxy/errors";
 import { ProxySession } from "@/app/v1/_lib/proxy/session";
 import { logger } from "@/lib/logger";
 import type { Provider, ProviderEndpoint, ProviderType } from "@/types/provider";
@@ -782,6 +782,63 @@ describe("ProxyForwarder - endpoint audit", () => {
       expect.objectContaining({
         reason: "request_success",
         endpointId: 77,
+      })
+    );
+  });
+
+  test("首字节前长等待后命中的客户端 499 应重归因为供应商失败", async () => {
+    const session = createSession(new URL("https://example.com/v1/messages"));
+    const provider = createProvider({
+      providerType: "claude",
+      providerVendorId: 123,
+      maxRetryAttempts: 1,
+    });
+    session.setProvider(provider);
+
+    const clientAbortController = new AbortController();
+    clientAbortController.abort();
+    Object.assign(session, {
+      clientAbortSignal: clientAbortController.signal,
+      forwardStartTime: Date.now() - 50_000,
+      ttfbMs: null,
+    });
+
+    mocks.getPreferredProviderEndpoints.mockResolvedValueOnce([
+      makeEndpoint({
+        id: 88,
+        vendorId: 123,
+        providerType: provider.providerType,
+        url: "https://api.example.com/v1/messages",
+      }),
+    ]);
+    mocks.categorizeErrorAsync.mockResolvedValueOnce(ErrorCategory.CLIENT_ABORT);
+
+    const doForward = vi.spyOn(
+      ProxyForwarder as unknown as { doForward: (...args: unknown[]) => unknown },
+      "doForward"
+    );
+    doForward.mockImplementationOnce(async () => {
+      throw new ProxyError("Request aborted by client", 499, undefined, "client_abort");
+    });
+
+    await expect(ProxyForwarder.send(session)).rejects.toMatchObject({ statusCode: 503 });
+
+    expect(mocks.recordFailure).toHaveBeenCalledTimes(1);
+    expect(mocks.recordFailure).toHaveBeenCalledWith(1, expect.any(ProxyError));
+
+    const recordedError = mocks.recordFailure.mock.calls[0]?.[1];
+    expect(recordedError).toBeInstanceOf(ProxyError);
+    expect((recordedError as ProxyError).statusCode).toBe(502);
+    expect((recordedError as ProxyError).message).toContain("首字节");
+
+    const chain = session.getProviderChain();
+    expect(chain).toHaveLength(1);
+    expect(chain[0]).toEqual(
+      expect.objectContaining({
+        reason: "retry_failed",
+        attemptNumber: 1,
+        endpointId: 88,
+        statusCode: 502,
       })
     );
   });

@@ -28,7 +28,11 @@ import type { Provider } from "@/types/provider";
 import type { SessionUsageUpdate } from "@/types/session";
 import { GeminiAdapter } from "../gemini/adapter";
 import type { GeminiResponse } from "../gemini/types";
-import { isClientAbortError } from "./errors";
+import {
+  isClientAbortError,
+  isSuspectedUpstreamAbortBeforeFirstByte,
+  SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE_THRESHOLD_MS,
+} from "./errors";
 import type { ProxySession } from "./session";
 import { consumeDeferredStreamingFinalization } from "./stream-finalization";
 
@@ -287,6 +291,22 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
   const detected = shouldDetectFake200
     ? detectUpstreamErrorFromSseOrJsonText(allContent)
     : ({ isError: false } as const);
+  const suspectedUpstreamAbortBeforeFirstByte =
+    !streamEndedNormally && clientAborted && isSuspectedUpstreamAbortBeforeFirstByte(session);
+
+  if (suspectedUpstreamAbortBeforeFirstByte) {
+    const waitMs = Math.max(0, Date.now() - (session.forwardStartTime ?? session.startTime));
+    logger.warn(
+      "[ResponseHandler] Suspected upstream abort before first byte, finalizing as provider failure",
+      {
+        sessionId: session.sessionId ?? null,
+        providerId: provider?.id ?? null,
+        providerName: provider?.name ?? null,
+        waitMs,
+        thresholdMs: SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE_THRESHOLD_MS,
+      }
+    );
+  }
 
   // “内部结算用”的状态码（不会改变客户端实际 HTTP 状态码）。
   // - 假 200：优先映射为“推断得到的 4xx/5xx”（未命中则回退 502），确保内部统计/熔断/会话绑定把它当作失败。
@@ -306,8 +326,12 @@ async function finalizeDeferredStreamingFinalizationIfNeeded(
     }
     errorMessage = detected.detail ? `${detected.code}: ${detected.detail}` : detected.code;
   } else if (!streamEndedNormally) {
-    effectiveStatusCode = clientAborted ? 499 : 502;
-    errorMessage = clientAborted ? "CLIENT_ABORTED" : (abortReason ?? "STREAM_ABORTED");
+    effectiveStatusCode = suspectedUpstreamAbortBeforeFirstByte ? 502 : clientAborted ? 499 : 502;
+    errorMessage = suspectedUpstreamAbortBeforeFirstByte
+      ? "SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE"
+      : clientAborted
+        ? "CLIENT_ABORTED"
+        : (abortReason ?? "STREAM_ABORTED");
   } else {
     // streamEndedNormally=true
     effectiveStatusCode = upstreamStatusCode;

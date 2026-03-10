@@ -14,6 +14,10 @@ import type { ErrorOverrideResponse } from "@/repository/error-rules";
 import type { ProviderChainItem } from "@/types/message";
 import type { ProxySession } from "./session";
 
+export type ProxyErrorClassificationHint = "client_abort";
+
+export const SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE_THRESHOLD_MS = 45_000;
+
 export class ProxyError extends Error {
   constructor(
     message: string,
@@ -54,7 +58,8 @@ export class ProxyError extends Error {
        * 命中的推断规则 id（仅用于内部调试/审计，不应用于用户展示文案）。
        */
       statusCodeInferenceMatcherId?: string;
-    }
+    },
+    public readonly classificationHint?: ProxyErrorClassificationHint
   ) {
     super(message);
     this.name = "ProxyError";
@@ -686,8 +691,8 @@ export async function getErrorOverrideAsync(
  *
  * 检测逻辑（优先级从高到低）：
  * 1. 错误名称检查（最可靠）：AbortError、ResponseAborted
- * 2. HTTP 状态码检查：499（Client Closed Request）
- * 3. 错误消息检查（向后兼容）：仅检查精确的中断消息
+ * 2. 代理内部显式标记：ProxyError.classificationHint === 'client_abort'
+ * 3. 错误消息检查（向后兼容）：仅检查精确的标准中断消息
  *
  * @param error - 错误对象
  * @returns 是否为客户端中断错误
@@ -702,19 +707,45 @@ export function isClientAbortError(error: Error): boolean {
     return true;
   }
 
-  // 2. 检查 HTTP 状态码（Nginx 使用的 "Client Closed Request"）
-  if (error instanceof ProxyError && error.statusCode === 499) {
+  // 2. 仅信任代理内部显式标记的客户端 499，避免把上游真实 HTTP 499 误判为客户端断开
+  if (error instanceof ProxyError && error.classificationHint === "client_abort") {
     return true;
   }
 
   // 3. 检查精确的错误消息（白名单模式，向后兼容）
-  const abortMessages = [
-    "This operation was aborted", // 标准 AbortError 消息
-    "The user aborted a request", // 浏览器标准消息
-    "aborted", // 向后兼容（但需在前两个检查失败后才使用）
-  ];
+  const abortMessages = new Set([
+    "This operation was aborted",
+    "The user aborted a request",
+    "The operation was aborted",
+  ]);
 
-  return abortMessages.some((msg) => error.message.includes(msg));
+  return abortMessages.has(error.message.trim());
+}
+
+export function isSuspectedUpstreamAbortBeforeFirstByte(
+  session: ProxySession,
+  minimumWaitMs: number = SUSPECTED_UPSTREAM_ABORT_BEFORE_FIRST_BYTE_THRESHOLD_MS
+): boolean {
+  if (!session.clientAbortSignal?.aborted) {
+    return false;
+  }
+
+  if (session.ttfbMs !== null) {
+    return false;
+  }
+
+  if (session.forwardStartTime === null) {
+    return false;
+  }
+
+  const sessionWithController = session as ProxySession & {
+    responseController?: AbortController;
+  };
+  if (sessionWithController.responseController?.signal.aborted) {
+    return false;
+  }
+
+  return Date.now() - session.forwardStartTime >= minimumWaitMs;
 }
 
 /**
@@ -830,7 +861,7 @@ export function isEmptyResponseError(error: unknown): error is EmptyResponseErro
  * 判断错误类型（异步版本）
  *
  * 分类规则（优先级从高到低）：
- * 1. 客户端主动中断（AbortError 或 error.code === 'ECONNRESET' 且 statusCode === 499）
+ * 1. 客户端主动中断（AbortError / ResponseAborted / 代理内部显式标记的 client_abort）
  *    → 客户端关闭连接或主动取消请求
  *    → 不应计入熔断器（不是供应商问题）
  *    → 不应重试（客户端已经不想要结果了）

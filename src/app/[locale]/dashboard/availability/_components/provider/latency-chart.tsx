@@ -157,7 +157,7 @@ export function LatencyChart({ providers, className }: LatencyChartProps) {
                           style={{ backgroundColor: item.color }}
                         />
                         <span className="text-muted-foreground">
-                          {chartConfig[String(item.dataKey) as keyof typeof chartConfig]?.label ||
+                          {chartConfig[item.dataKey as keyof typeof chartConfig]?.label ||
                             String(item.dataKey)}
                           :
                         </span>

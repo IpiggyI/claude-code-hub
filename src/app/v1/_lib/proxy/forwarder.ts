@@ -2471,9 +2471,30 @@ export class ProxyForwarder {
         );
       }
 
-      // ⭐ 检测客户端主动中断（使用统一的精确检测函数）
+      // ⭐ 检测中断来源：区分客户端主动中断 vs 上游服务端关闭连接
+      // 注意：代理侧超时（responseController.signal.aborted）已在上方第一个 if 块处理，
+      // 能到达这里说明 responseController 未超时，需要区分客户端 vs 上游两种情况。
       if (isClientAbortError(err)) {
-        logger.warn("ProxyForwarder: Request/response aborted", {
+        const isRealClientAbort = session.clientAbortSignal?.aborted ?? false;
+
+        if (!isRealClientAbort) {
+          // 上游服务端主动关闭连接（如 HTTP/2 RST_STREAM、限额关闭等）
+          // ResponseAborted 由 undici 在服务端发送 RST_STREAM 时抛出，不是客户端行为
+          // 应归类为 PROVIDER_ERROR：计入熔断器，允许供应商切换
+          logger.warn("ProxyForwarder: Upstream closed connection unexpectedly", {
+            providerId: provider.id,
+            providerName: provider.name,
+            proxyUrl: new URL(proxyUrl).origin,
+            errorName: err.name,
+            errorMessage: err.message || "(empty message)",
+            errorCode: err.code || "N/A",
+            reason: "Server-side RST_STREAM or connection close, not a client abort",
+          });
+          throw new ProxyError("Upstream connection closed by server", 502);
+        }
+
+        // 真正的客户端主动中断：不计入熔断器，不重试，直接返回
+        logger.warn("ProxyForwarder: Request aborted by client", {
           providerId: provider.id,
           providerName: provider.name,
           proxyUrl: new URL(proxyUrl).origin,
@@ -2481,8 +2502,6 @@ export class ProxyForwarder {
           errorMessage: err.message || "(empty message)",
           errorCode: err.code || "N/A",
         });
-
-        // 客户端中断不应计入熔断器，也不重试，直接抛出错误
         throw new ProxyError(
           err.name === "ResponseAborted"
             ? "Response transmission aborted"

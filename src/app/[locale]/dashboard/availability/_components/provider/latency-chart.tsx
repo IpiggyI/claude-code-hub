@@ -151,7 +151,7 @@ export function LatencyChart({ providers, className }: LatencyChartProps) {
                   <div className="font-medium mb-1">{formatTime(label as string)}</div>
                   <div className="space-y-1">
                     {payload.map((item) => (
-                      <div key={item.dataKey} className="flex items-center gap-2">
+                      <div key={String(item.dataKey)} className="flex items-center gap-2">
                         <div
                           className="w-2 h-2 rounded-full"
                           style={{ backgroundColor: item.color }}
